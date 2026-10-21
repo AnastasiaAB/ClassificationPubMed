@@ -19,16 +19,17 @@ Notes:
 import time
 import csv
 import xml.etree.ElementTree as ET
-from typing import Any
-
 import requests
 import os
 from dotenv import load_dotenv
 from config import RAW_CSV, ROOT
 
 # ---- Configuration ----------------------------------------------------
- 
-NCBI_EMAIL = "asfokina@gmail.com"   # required by NCBI usage policy
+load_dotenv(ROOT / ".env")
+
+NCBI_EMAIL = os.environ.get("NCBI_EMAIL")
+NCBI_API_KEY = os.environ.get("NCBI_API_KEY")
+
 NCBI_TOOL = "ds-portfolio-project"
 NCBI_API_KEY = None                 # optional: set to your key string to speed up requests
  
