@@ -1,0 +1,10 @@
+# Versions below are the ones the results in this repo were produced with;
+# older minor versions will likely work too.
+numpy>=1.26
+pandas>=2.0
+scipy>=1.11        # scipy.stats.binomtest requires >= 1.7
+scikit-learn>=1.4
+matplotlib>=3.8
+joblib>=1.3
+python-dotenv
+requests

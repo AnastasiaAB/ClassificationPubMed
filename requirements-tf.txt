@@ -1,0 +1,5 @@
+# Extra dependencies for src/07_train_mlp_tensorflow.py
+# Install into the same venv:  pip install -r requirements-tf.txt
+# TensorFlow supports a limited range of Python versions; 3.10-3.12 is the safe range.
+-r requirements.txt
+tensorflow>=2.16

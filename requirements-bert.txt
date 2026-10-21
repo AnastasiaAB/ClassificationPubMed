@@ -1,0 +1,8 @@
+# Extra dependencies for src/08_extract_bert_embeddings.py
+# Install:  pip install -r requirements-bert.txt
+# CPU-only machine? A smaller PyTorch build avoids a multi-GB download:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# TensorFlow and PyTorch can conflict when installed together; a separate venv for each is safest.
+-r requirements.txt
+torch>=2.1
+transformers>=4.40
