@@ -70,14 +70,20 @@ def main():
     df["abstract"] = clean_whitespace(df["abstract"])
     df["journal"] = clean_whitespace(df["journal"])
 
+    # Fail loudly on a missing/misspelled label: the comparison below would otherwise
+    # silently turn it into category_a (0) and mislabel the row
+    valid_labels = {"category_a", "category_b"}
+    assert df["label"].isin(valid_labels).all(), "missing or unexpected labels in the raw data"
+
+    # Encode label as binary target for modeling convenience
+    df["label_binary"] = (df["label"] == "category_b").astype(int)
+
     # Encode label as binary target for modeling convenience
     df["label_binary"] = (df["label"] == "category_b").astype(int)
 
     # --- Load into SQLite ---
     conn = sqlite3.connect(OUTPUT_DB)
     df.to_sql("abstracts", conn, if_exists="replace", index=False)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_pmid ON abstracts(pmid)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_label ON abstracts(label)")
     conn.commit()
     conn.close()
 

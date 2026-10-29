@@ -14,8 +14,6 @@ neither one substitutes for the other:
    models) -> on this one particular sample, does one model get
    significantly more of the disagreement cases right than the other?
 
-Implemented directly with scipy (no statsmodels dependency, since this
-environment has no internet access to install it).
 """
 
 import numpy as np
