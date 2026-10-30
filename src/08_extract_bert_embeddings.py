@@ -16,7 +16,6 @@ computing embeddings for the test set cannot leak label information.
 
 CPU-friendly: texts are processed shortest-first so batches carry little padding, and
 progress is checkpointed so an interrupted run resumes where it stopped.
-Expect roughly tens of minutes on a laptop CPU (not measured by me).
 
 Output: data/processed/bert_embeddings.npz (embeddings, pmids, model name, settings)
 """
