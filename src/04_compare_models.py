@@ -1,106 +1,187 @@
 """
-Step 4b: Compare the baseline and model 2 with paired statistical tests.
+Step 4: Compare every model against the baseline with paired statistical tests.
 
-Loads the CV fold scores and test-set predictions saved by
-02_baseline_model.py and 03_train_model2.py -- no retraining happens here.
+Reads the per-fold CV scores and held-out test predictions saved by the training scripts
+(02, 03, 07, 09); nothing is retrained here. Models whose result files are missing are skipped.
 
-Two paired tests, because they answer slightly different questions and
-neither one substitutes for the other:
+Primary question: does any challenger reliably beat the baseline?  That is one family of
+comparisons (each challenger vs. the baseline), so p-values are Holm-corrected within each test
+type. With 3 challengers, uncorrected p < 0.05 would give a ~14% chance of at least one false
+"significant" result even if no model differed at all.
 
-1. Paired t-test on matched CV fold accuracies (same 5 folds for both
-   models) -> is the *typical* difference in accuracy across resamples
-   of the training data statistically distinguishable from zero?
-2. McNemar's test on the held-out test set (same 556 examples for both
-   models) -> on this one particular sample, does one model get
-   significantly more of the disagreement cases right than the other?
+Two paired tests, because they answer different questions:
+1. Paired t-test on matched per-fold CV accuracies (same 5 folds for every model): is the typical
+   gap across resamples of the training data distinguishable from zero?
+2. McNemar's test on the held-out test set (same examples for every model): among examples where
+   the two models disagree, does one win more often than chance?
 
+Also reported: Wilson 95% intervals for test accuracy, and a calibration / error profile
+(how confident each model is when it is wrong) plus how many models miss each test example.
+Implemented with scipy only (no statsmodels dependency).
 """
 
 import numpy as np
 import pandas as pd
 from scipy import stats
+from sklearn.metrics import f1_score, roc_auc_score, brier_score_loss, log_loss
 from config import RESULTS
 
-BASELINE_CV_CSV = RESULTS / "baseline_cv_scores.csv"
-MODEL2_CV_CSV = RESULTS / "model2_cv_scores.csv"
-BASELINE_TEST_CSV = RESULTS / "baseline_test_predictions.csv"
-MODEL2_TEST_CSV = RESULTS / "model2_test_predictions.csv"
+MODELS = {  # file prefix -> display name
+    "baseline": "Baseline (TF-IDF + LogReg)",
+    "model2": "TF-IDF + SVD + GradBoost",
+    "mlp": "TF-IDF + MLP (TensorFlow)",
+    "bert": "Frozen BiomedBERT + LogReg",
+}
+REFERENCE = "baseline"
 ALPHA = 0.05
 
+
+def mean_ci(values, confidence=0.95):
+    values = np.asarray(values, dtype=float)
+    n = len(values)
+    half = stats.sem(values) * stats.t.ppf((1 + confidence) / 2, n - 1)
+    return values.mean(), half
+
+
+def wilson_ci(k, n, confidence=0.95):
+    """Wilson score interval for a proportion k/n."""
+    z = stats.norm.ppf((1 + confidence) / 2)
+    p = k / n
+    centre = (p + z**2 / (2 * n)) / (1 + z**2 / n)
+    half = z * np.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / (1 + z**2 / n)
+    return centre - half, centre + half
+
+
+def holm_adjust(pvals):
+    """Holm step-down adjusted p-values (controls family-wise error rate)."""
+    pvals = np.asarray(pvals, dtype=float)
+    m = len(pvals)
+    order = np.argsort(pvals)
+    adjusted = np.empty(m)
+    running_max = 0.0
+    for rank, idx in enumerate(order):
+        running_max = max(running_max, (m - rank) * pvals[idx])
+        adjusted[idx] = min(1.0, running_max)
+    return adjusted
+
+
 def mcnemar_test(b, c, exact_threshold=25):
-    """
-    McNemar's test on a paired 2x2 contingency table.
-    b = count where model A correct, model B wrong
-    c = count where model B correct, model A wrong
-    Uses the exact binomial form for small samples (b + c < exact_threshold),
-    otherwise the chi-square approximation with continuity correction.
-    """
+    """McNemar's test. b = reference right & challenger wrong, c = challenger right & reference wrong.
+    Exact binomial when b + c < exact_threshold, else chi-square with continuity correction."""
     n = b + c
     if n == 0:
-        return 0.0, 1.0
+        return 1.0
     if n < exact_threshold:
-        result = stats.binomtest(min(b, c), n, 0.5, alternative="two-sided")
-        return float(n), result.pvalue
-    statistic = (abs(b - c) - 1) ** 2 / n
-    p_value = 1 - stats.chi2.cdf(statistic, df=1)
-    return statistic, p_value
+        return stats.binomtest(min(b, c), n, 0.5, alternative="two-sided").pvalue
+    return float(1 - stats.chi2.cdf((abs(b - c) - 1) ** 2 / n, df=1))
+
 
 def main():
-    base_cv = pd.read_csv(BASELINE_CV_CSV)
-    m2_cv = pd.read_csv(MODEL2_CV_CSV)
-    base_test = pd.read_csv(BASELINE_TEST_CSV)
-    m2_test = pd.read_csv(MODEL2_TEST_CSV)
+    cv, test = {}, {}
+    for key in MODELS:
+        cv_path, test_path = RESULTS / f"{key}_cv_scores.csv", RESULTS / f"{key}_test_predictions.csv"
+        if cv_path.exists() and test_path.exists():
+            cv[key], test[key] = pd.read_csv(cv_path), pd.read_csv(test_path)
+        else:
+            print(f"(skipping {key}: result files not found)")
+    if REFERENCE not in cv:
+        raise SystemExit("baseline results are required (run 02_baseline_model.py)")
+    challengers = [k for k in cv if k != REFERENCE]
 
-    print("=" * 60)
-    print("CV ACCURACY BY FOLD")
-    print("=" * 60)
-    for f, b, m in zip(base_cv["fold"], base_cv["accuracy"], m2_cv["accuracy"]):
-        print(f"Fold {f}: baseline={b:.3f}  model2={m:.3f}")
+    # Paired comparisons are only valid if every model saw the identical test set
+    ref = test[REFERENCE]
+    for key in challengers:
+        assert np.array_equal(ref["y_true"].to_numpy(), test[key]["y_true"].to_numpy()) \
+            and ref["text"].equals(test[key]["text"]), f"{key} was evaluated on a different test set"
+    n_test = len(ref)
+    y_true = ref["y_true"].to_numpy()
+
+    # ---- 1. Cross-validation summary ----
+    print("=" * 78)
+    print("CROSS-VALIDATION (5-fold on the training set): mean [95% t-interval]")
+    print("=" * 78)
+    for key in cv:
+        acc_m, acc_h = mean_ci(cv[key]["accuracy"])
+        print(f"{MODELS[key]:30s} acc {acc_m:.3f} [{acc_m - acc_h:.3f}, {acc_m + acc_h:.3f}]   "
+              f"f1 {cv[key]['f1'].mean():.3f}   auc {cv[key]['roc_auc'].mean():.3f}")
+
+    # ---- 2. Held-out test summary ----
     print()
+    print("=" * 78)
+    print(f"HELD-OUT TEST SET (n={n_test}): accuracy with Wilson 95% interval")
+    print("=" * 78)
+    pred = {k: test[k]["y_pred"].to_numpy() for k in test}
+    proba = {k: test[k]["y_proba"].to_numpy() for k in test}
+    correct = {k: pred[k] == y_true for k in test}
+    for key in test:
+        k_ok = int(correct[key].sum())
+        lo, hi = wilson_ci(k_ok, n_test)
+        print(f"{MODELS[key]:30s} acc {k_ok / n_test:.3f} [{lo:.3f}, {hi:.3f}]   "
+              f"f1 {f1_score(y_true, pred[key]):.3f}   auc {roc_auc_score(y_true, proba[key]):.3f}   "
+              f"errors {n_test - k_ok}")
 
-    # --- Test 1: paired t-test on matched CV fold accuracies ---
-    diffs = m2_cv["accuracy"].values - base_cv["accuracy"].values
-    t_stat, p_value = stats.ttest_rel(m2_cv["accuracy"], base_cv["accuracy"])
-    print("=" * 60)
-    print("PAIRED T-TEST on matched CV fold accuracies (model2 - baseline)")
-    print("=" * 60)
-    print(f"mean difference: {diffs.mean():+.4f}")
-    print(f"t-statistic: {t_stat:.3f},  p-value: {p_value:.4f}")
-    if p_value < ALPHA:
-        print(f"-> significant at alpha={ALPHA}: model2's CV accuracy differs from baseline's")
-    else:
-        print(f"-> NOT significant at alpha={ALPHA}: no evidence the two models differ in CV accuracy")
+    # ---- 3. Paired t-test on CV accuracy, challenger vs baseline ----
+    rows = []
+    for key in challengers:
+        a, b = cv[key]["accuracy"].to_numpy(), cv[REFERENCE]["accuracy"].to_numpy()
+        diff = a - b
+        t_stat, p = stats.ttest_rel(a, b)
+        d_mean, d_half = mean_ci(diff)
+        rows.append((key, d_mean, d_mean - d_half, d_mean + d_half, int((diff > 0).sum()), t_stat, p))
+    p_adj = holm_adjust([r[-1] for r in rows])
     print()
+    print("=" * 78)
+    print(f"PAIRED T-TEST on CV accuracy, each model vs. {REFERENCE} (difference = model - baseline)")
+    print("=" * 78)
+    print(f"{'model':30s} {'mean diff':>10s} {'95% CI of diff':>20s} {'folds >':>8s} {'p':>8s} {'Holm p':>8s}")
+    for (key, d, lo, hi, wins, t_stat, p), pa in zip(rows, p_adj):
+        print(f"{MODELS[key]:30s} {d * 100:+9.2f}p {f'[{lo * 100:+.2f}, {hi * 100:+.2f}]':>20s} "
+              f"{wins:>6d}/5 {p:8.4f} {pa:8.4f}")
 
-    # --- Held-out test set metrics side by side ---
-    print("=" * 60)
-    print(f"HELD-OUT TEST SET (n={len(base_test)})")
-    print("=" * 60)
-    base_correct = (base_test["y_pred"] == base_test["y_true"]).values
-    m2_correct = (m2_test["y_pred"] == m2_test["y_true"]).values
-    print(f"accuracy: baseline={base_correct.mean():.3f}  model2={m2_correct.mean():.3f}")
+    # ---- 4. McNemar on the held-out test set, challenger vs baseline ----
+    rows = []
+    for key in challengers:
+        b = int((correct[REFERENCE] & ~correct[key]).sum())   # baseline right, challenger wrong
+        c = int((~correct[REFERENCE] & correct[key]).sum())   # challenger right, baseline wrong
+        rows.append((key, b, c, mcnemar_test(b, c)))
+    p_adj = holm_adjust([r[-1] for r in rows])
     print()
+    print("=" * 78)
+    print(f"MCNEMAR'S TEST on the test set, each model vs. {REFERENCE}")
+    print("=" * 78)
+    print(f"{'model':30s} {'only baseline right':>20s} {'only model right':>17s} {'p':>8s} {'Holm p':>8s}")
+    for (key, b, c, p), pa in zip(rows, p_adj):
+        print(f"{MODELS[key]:30s} {b:>20d} {c:>17d} {p:8.4f} {pa:8.4f}")
 
-    # --- Test 2: McNemar's test on held-out test set (paired, same items) ---
-    both_correct = np.sum(base_correct & m2_correct)
-    base_only = np.sum(base_correct & ~m2_correct)
-    m2_only = np.sum(~base_correct & m2_correct)
-    both_wrong = np.sum(~base_correct & ~m2_correct)
+    # ---- 5. Calibration / error profile ----
+    print()
+    print("=" * 78)
+    print("ERROR PROFILE (confidence = max(p, 1-p); 'confident' = confidence >= 0.9)")
+    print("=" * 78)
+    print(f"{'model':30s} {'errors':>6s} {'conf. on errors':>16s} {'confident errors':>17s} {'Brier':>7s} {'log loss':>9s}")
+    for key in test:
+        conf = np.maximum(proba[key], 1 - proba[key])
+        wrong = ~correct[key]
+        print(f"{MODELS[key]:30s} {int(wrong.sum()):>6d} {conf[wrong].mean():>16.3f} "
+              f"{int((conf[wrong] >= 0.9).sum()):>10d}/{int(wrong.sum()):<5d}"
+              f"{brier_score_loss(y_true, proba[key]):>7.3f} {log_loss(y_true, proba[key]):>9.3f}")
 
-    statistic, p_value = mcnemar_test(base_only, m2_only)
+    # ---- 6. How many models miss each example ----
+    n_wrong = sum((~correct[k]).astype(int) for k in test)
+    print()
+    print("=" * 78)
+    print(f"HOW MANY OF THE {len(test)} MODELS MISCLASSIFY EACH TEST EXAMPLE")
+    print("=" * 78)
+    for m in range(len(test) + 1):
+        print(f"misclassified by exactly {m}: {int((n_wrong == m).sum())}")
+    print(f"\nTest examples all {len(test)} models misclassify: {int((n_wrong == len(test)).sum())} "
+          f"(row positions saved to results/missed_by_all_models.csv)")
+    # Row positions only (no abstract text), so the file is safe to commit; look the rows up in
+    # any *_test_predictions.csv (git-ignored) to read them
+    missed = pd.DataFrame({"test_row": np.flatnonzero(n_wrong == len(test)),
+                           "y_true": y_true[n_wrong == len(test)]})
+    missed.to_csv(RESULTS / "missed_by_all_models.csv", index=False)
 
-    print("=" * 60)
-    print("MCNEMAR'S TEST on held-out test set (paired predictions)")
-    print("=" * 60)
-    print(f"both correct: {both_correct}  |  baseline only correct: {base_only}  |  model2 only correct: {m2_only}  |  both wrong: {both_wrong}")
-    n_disc = base_only + m2_only
-    test_kind = "exact binomial" if n_disc < 25 else "chi-square, continuity-corrected"
-    print(f"discordant pairs: {n_disc}  |  test used: {test_kind}  |  p-value: {p_value:.4f}")
-    if p_value < ALPHA:
-        winner = "model2" if m2_only > base_only else "baseline"
-        print(f"-> significant at alpha={ALPHA}: {winner} makes significantly fewer test-set errors")
-    else:
-        print(f"-> NOT significant at alpha={ALPHA}: the disagreement pattern is consistent with chance")
 
 if __name__ == "__main__":
     main()
